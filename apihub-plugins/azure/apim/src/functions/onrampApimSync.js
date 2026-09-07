@@ -213,12 +213,14 @@ const attributeResourceName = (attrId) =>
     `${locationResourceName()}/attributes/${attrId}`;
 
 // ---- identifier parity helpers (grouping.go / clients.go) --------------
-// azureBaseAPIID: strip APIM's ";rev=N" suffix (grouping.go). Do NOT lowercase:
-// the pull path keys resources by the apiId/serviceName as-is.
-const azureBaseAPIID = (id) => {
-  const i = (id || '').indexOf(';rev=');
-  return i >= 0 ? id.slice(0, i) : id;
-};
+// azureBaseAPIID: strip APIM's ";rev=N" suffix (grouping.go). Do NOT lowercase
+// the rest of the id: the pull path keys resources by the apiId/serviceName
+// as-is. The suffix match IS case-insensitive because Event Grid emits ";Rev=N"
+// (capital R) while ARM and the pull path use ";rev=N" -- a case-sensitive
+// match here silently leaves the suffix on, which breaks original_id parity
+// with the pull engine and makes every pushed API look like an orphan to the
+// next reconcile.
+const azureBaseAPIID = (id) => (id || '').replace(/;rev=\d+$/i, '');
 
 // azureLastSegment: final path segment of an ARM resource id (clients.go).
 const azureLastSegment = (s) => {
@@ -347,6 +349,11 @@ function urlHost(raw) {
 }
 
 // ---- event parsing (APIM-native) --------------------------------------
+// The revision suffix is stripped here, once, so every downstream consumer
+// (ARM reads, gateway-membership tests, original_id and deployment
+// resource_uri construction) sees the same base id the pull engine uses. ARM
+// resolves the base id to the current revision, which is what an APICreated /
+// APIUpdated event describes.
 function parseResourceUri(uri) {
   const m = uri?.match(
       /subscriptions\/([^/]+)\/resourceGroups\/([^/]+)\/providers\/Microsoft\.ApiManagement\/service\/([^/]+)\/apis\/([^/?]+)/i);
@@ -354,7 +361,7 @@ function parseResourceUri(uri) {
     subscriptionId: m[1],
     resourceGroup: m[2],
     serviceName: m[3],
-    apiId: m[4]
+    apiId: azureBaseAPIID(m[4])
   } :
              null;
 }
@@ -510,9 +517,19 @@ async function exportSpec(base, apiId, format, armToken, context) {
       `${base}/apis/${apiId}?export=true&format=${
           encodeURIComponent(format)}&api-version=${APIM_API_VERSION}`,
       armToken);
-  const link = exp?.value?.link ||
+  // The SAS link's position in the response varies by api-version: 2024-05-01
+  // returns {link} at the top level, other versions nest it under value or
+  // properties.value. Check all three, outermost first.
+  const link = exp?.link || exp?.value?.link ||
       exp?.properties?.value?.link;  // hoist: properties.value -> value
-  if (!link) return null;
+  if (!link) {
+    // Logged rather than dropped silently: a missing link is indistinguishable
+    // from "API has no spec" at the call site, and the resulting empty catalog
+    // entry is otherwise invisible.
+    context.log(`spec export (${format}) for ${
+        apiId}: no SAS link in response; publishing metadata-only`);
+    return null;
+  }
   context.log(
       `spec export (${format}) for ${apiId} -> SAS host ${urlHost(link)}`);
   const sr = await fetch(
@@ -617,7 +634,9 @@ async function fetchA2AAgentCard(scope, api, props, context) {
 // enrichment).
 async function fetchApimData(scope, context) {
   const armToken = await getAzureToken(ARM_RESOURCE);
-  const apiId = scope.apiId;  // current-revision apiId (as-is)
+  // Base apiId: parseResourceUri already stripped any ";rev=N" suffix, so ARM
+  // resolves this to the current revision and every id we emit matches pull.
+  const apiId = scope.apiId;
   const base =
       `${ARM_RESOURCE}/subscriptions/${scope.subscriptionId}/resourceGroups/${
           scope.resourceGroup}` +

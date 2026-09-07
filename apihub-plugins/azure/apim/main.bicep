@@ -45,7 +45,10 @@ param apimApiVersion string = '2024-05-01'
 resource apim 'Microsoft.ApiManagement/service@2023-05-01-preview' existing = { name: apimName }
 
 var sfx       = uniqueString(resourceGroup().id)
-var funcName  = 'func-apihub-onramp'
+// Function App names become <name>.azurewebsites.net and must be globally
+// unique across all of Azure, so a per-RG suffix is appended. The remaining
+// names are RG-scoped and stay stable so operators can locate them by name.
+var funcName  = 'func-apihub-onramp-${substring(sfx, 0, 6)}'
 var planName  = 'plan-apihub-onramp'
 var uamiName  = 'id-apihub-onramp'
 var lawName   = 'law-apihub-onramp'

@@ -39,6 +39,15 @@ credentials are stored in Azure.
     holding the APIM (to deploy resources), plus `User Access Administrator` (to
     assign the APIM `Reader` role), and `Application Administrator` at the Entra
     tenant level (to create the App Registration).
+5.  **Azure subscription tier:** a **Pay-As-You-Go** or other paid subscription.
+    **Free / Trial subscriptions cannot deploy this sample** — they ship with
+    `0` quota for the Consumption Plan (Y1) SKU that the Function App in
+    [Step 6](#step-6-deploy-the-bicep-template) requires, and the deploy fails
+    preflight with `SubscriptionIsOverQuotaForSku`. Upgrade via **Subscriptions
+    → your subscription → Overview → Upgrade** before starting; Pay-As-You-Go
+    grants the default Y1 quota automatically. If the upgrade does not raise the
+    Y1 limit for your region, see [Step 6.0](#step-6-deploy-the-bicep-template)
+    for how to request it explicitly.
 
 ## Values to gather before starting
 
@@ -83,7 +92,11 @@ Redirect URI            | Leave blank
 Click **Register**.
 
 **1.2** On the app's **Overview** page, copy the **Application (client) ID** —
-this is `<AZURE_APP_CLIENT_ID>`.
+this is `<AZURE_APP_CLIENT_ID>`. Then set an **Application ID URI**: on the same
+Overview page, click **Add an Application ID URI → Set**, keep the default value
+`api://<AZURE_APP_CLIENT_ID>`, and **Save**. Without this URI Microsoft Entra
+will refuse to issue tokens with that audience, and the Function fails silently
+at `AADSTS500011` when it tries to fetch a subject token for WIF.
 
 **1.3** In the left nav → **Certificates & secrets → + New client secret**.
 
@@ -120,10 +133,18 @@ The API hub plugin instance reads `<AZURE_APP_CLIENT_SECRET>` from a Secret
 Manager secret. The application id is not sensitive and goes directly on the
 plugin instance form.
 
-**2.1** Enable the Secret Manager API (skip if it's already enabled):
+**2.1** Enable the Secret Manager, IAM Credentials, and Security Token Service
+APIs (skip whichever are already enabled). All three are required — Secret
+Manager holds the Azure client secret, and IAM Credentials + STS are used by the
+real-time push in Steps 4-9 for the Workload Identity Federation token exchange.
+Missing IAM Credentials or STS surfaces later as an `impersonation HTTP 403`
+from the Function:
 
 ```bash
-gcloud services enable secretmanager.googleapis.com \
+gcloud services enable \
+    secretmanager.googleapis.com \
+    iamcredentials.googleapis.com \
+    sts.googleapis.com \
   --project=<GCP_PROJECT_ID>
 ```
 
@@ -169,7 +190,7 @@ gcloud secrets add-iam-policy-binding <SECRET_NAME> \
 plugin instance form in Step 3:
 
 ```
-projects/<GCP_PROJECT_ID>/secrets/<SECRET_NAME>/versions/latest
+projects/<GCP_PROJECT_ID>/secrets/<SECRET_NAME>/versions/<VERSION_NUMBER>
 ```
 
 ### Step 3: Create the API hub plugin instance
@@ -210,7 +231,7 @@ Field                                        | Value
 -------------------------------------------- | -----
 **Auth type**                                | **OAuth 2.0 Client Credentials** (required)
 **Client ID**                                | `<AZURE_APP_CLIENT_ID>` from Step 1
-**Client secret** (Secret Manager reference) | `projects/<GCP_PROJECT_ID>/secrets/<SECRET_NAME>/versions/latest` from Step 2.4
+**Client secret** (Secret Manager reference) | `projects/<GCP_PROJECT_ID>/secrets/<SECRET_NAME>/versions/<VERSION_NUMBER>` from Step 2.4
 
 **Sync frequency:**
 
@@ -283,7 +304,10 @@ Provider name     | `azure-apim-oidc`
 Issuer (URL)      | `https://sts.windows.net/<AZURE_TENANT_ID>/`
 Allowed audiences | `api://<AZURE_APP_CLIENT_ID>` (from Step 1.2)
 
-Leave the "Configure provider attributes" step at its defaults.
+Under **Configure provider attributes**, verify that `google.subject` is mapped
+to `assertion.sub`. The default should already show this, but the Console
+occasionally clears the field and rejects the pool at Save with `attribute
+mapping is required`; if the input is empty, type `assertion.sub` manually.
 
 **5.3 Grant access** — pick **"Grant access using service account
 impersonation"** (not federated identities), select the `apihub-azure-onramp-sa`
@@ -304,50 +328,78 @@ The grant can be added later without deleting the pool.
 
 ### Step 6: Deploy the Bicep template
 
-In Azure Portal → **Deploy a custom template** (search "Deploy a custom
-template" in the top search bar).
+Deploy via **Azure Cloud Shell** (browser-based; no local tooling required). The
+Portal's "Build your own template in the editor" pane accepts only ARM JSON, but
+`az deployment` in Cloud Shell transpiles Bicep on the fly when you pass a
+`.bicep` file directly.
 
--   Click **Build your own template in the editor**.
--   Delete the placeholder content and paste the contents of `main.bicep` from
-    this directory. The Portal accepts Bicep directly.
--   Click **Save**.
--   **Subscription:** `<AZURE_SUBSCRIPTION_ID>`
--   **Resource group:** `<AZURE_RESOURCE_GROUP>` (the RG holding your APIM)
--   **Region:** `<AZURE_APIM_REGION>` (must match the APIM region)
--   **Parameters:**
+> If the deploy fails with `SubscriptionIsOverQuotaForSku: Current Limit (Y1
+> VMs): 0`, you are on a Free / Trial subscription. Upgrade to Pay-As-You-Go per
+> [Prerequisites](#prerequisites) item 5 and re-run — the upgrade grants Y1
+> quota automatically in most tenants. If it does not, follow Step 6.0 below.
 
-    | Parameter     | Value                                                    |
-    | ------------- | -------------------------------------------------------- |
-    | apimName      | `<AZURE_APIM_SERVICE>`                                   |
-    | location      | `<AZURE_APIM_REGION>`                                    |
-    | appId         | `<AZURE_APP_CLIENT_ID>` from Step 1                      |
-    | gcpProject    | `<GCP_PROJECT_ID>`                                       |
-    | projectNumber | `<GCP_PROJECT_NUMBER>`                                   |
-    | gcpLocation   | `<GCP_LOCATION>`                                         |
-    | instanceId    | `<PLUGIN_INSTANCE_ID>` from Step 3.4                     |
-    | poolId        | `apihub-azure-onramp-pool` (from Step 5.1 — override if  |
-    :               : you named your WIF pool differently)                     :
-    | providerId    | `azure-apim-oidc` (from Step 5.2 — override if you named |
-    :               : your OIDC provider differently)                          :
-    | saName        | `apihub-azure-onramp-sa` (from Step 4 — override if you  |
-    :               : named your GCP service account differently)              :
+**6.0** (Only if the subscription upgrade did not grant Y1 quota in your
+region.) Request Y1 quota explicitly: in the Azure Portal, search for
+**Quotas**, select **App Service** (older tenants list it under **Compute**),
+filter by **Provider = Microsoft.Web** and **Region = `<AZURE_APIM_REGION>`**,
+find **Dynamic App Service Plans**, tick the row, and submit **New Quota
+Request** for `1` (or higher for headroom). Small requests typically resolve in
+a few hours; worst case ~1 business day.
 
-    Leave the remaining parameters (`apihubHost`, `pluginId`,
-    `deploymentTypeId`, `apimApiVersion`, `tags`, `enableAppInsights`) at their
-    defaults.
+**6.1** In the Azure Portal, click the Cloud Shell icon (`>_`) in the top nav
+bar and pick **Bash**. On first use, accept the default when prompted to create
+a Cloud Shell storage account.
 
--   Click **Review + create → Create**.
+**6.2** In Cloud Shell, run `code main.bicep`. A VS Code-style editor opens in
+the upper pane. Paste the contents of `main.bicep` from this directory, save
+with **Ctrl+S**, then close with **Ctrl+Q**.
 
-Wait for status **Your deployment is complete** (~2 minutes).
+**6.3** Deploy.
 
-**6.5** After deployment, note the output values on the deployment's **Outputs**
+> ⚠️ Cloud Shell defaults to **PowerShell** on returning sessions, and the
+> multi-line ``\` continuations below are Bash syntax — pasting them into
+> a``PS>`prompt fails with`ParserError: Missing expression after unary operator
+> '-'`. If your prompt is `PS>`, type `bash`and press Enter to switch; the
+> prompt should become`$`(or`user@Azure:~$`).
+
+```bash
+az deployment group create \
+  --resource-group <AZURE_RESOURCE_GROUP> \
+  --template-file main.bicep \
+  --parameters \
+      apimName=<AZURE_APIM_SERVICE> \
+      location=<AZURE_APIM_REGION> \
+      appId=<AZURE_APP_CLIENT_ID> \
+      gcpProject=<GCP_PROJECT_ID> \
+      projectNumber=<GCP_PROJECT_NUMBER> \
+      gcpLocation=<GCP_LOCATION> \
+      instanceId=<PLUGIN_INSTANCE_ID>
+```
+
+Override `poolId`, `providerId`, or `saName` only if you named those resources
+differently in Steps 4-5 (defaults: `apihub-azure-onramp-pool`,
+`azure-apim-oidc`, `apihub-azure-onramp-sa`). Leave `apihubHost`, `pluginId`,
+`deploymentTypeId`, `apimApiVersion`, `tags`, and `enableAppInsights` at their
+defaults.
+
+Wait for the CLI to print `"provisioningState": "Succeeded"` (~2 minutes). The
+deployment is also visible in the Portal under the resource group's
+**Deployments** blade.
+
+> If Cloud Shell is unavailable in your tenant, transpile the Bicep to ARM JSON
+> on a workstation with Azure CLI installed (`az bicep build --file main.bicep`
+> emits `main.json`), then in the Portal use **Deploy a custom template → Build
+> your own template in the editor → Load file** and pick `main.json`. Fill the
+> parameters listed above via the Portal form.
+
+**6.4** After deployment, note the output values on the deployment's **Outputs**
 tab. Copy `uamiPrincipalId` — this is `<AZURE_MI_OBJECT_ID>`.
 
-**6.6** Complete the WIF principal binding you deferred in Step 5.3: go back to
+**6.5** Complete the WIF principal binding you deferred in Step 5.3: go back to
 the Workload Identity Pool, click into the `apihub-azure-onramp-sa` grant, and
 add the principal with `subject` = `<AZURE_MI_OBJECT_ID>`.
 
-**6.7** Also add a **federated credential** to the App Registration from Step 1
+**6.6** Also add a **federated credential** to the App Registration from Step 1
 so the Azure Function's managed identity can obtain a token for
 `api://<AZURE_APP_CLIENT_ID>`. Azure Portal → **Entra ID → App registrations →
 apihub-azure-apim → Certificates & secrets → Federated credentials → + Add
@@ -371,14 +423,37 @@ function code slot empty.
 Prerequisites: [Azure Functions Core Tools][func-tools] and the
 [Azure CLI][az-cli] installed. Both are pre-installed in Azure Cloud Shell.
 
-Clone this sample (if you haven't already) and run:
+The Function App name is `func-apihub-onramp-<hash>`, where `<hash>` is a
+6-character suffix derived from the resource group ID (so the name is globally
+unique — Function Apps become `*.azurewebsites.net` DNS entries). Grab the exact
+name from the Bicep output — read it directly from Step 6.4's outputs tab
+(`functionAppName`), or from Cloud Shell:
+
+```bash
+FUNC=$(az deployment group show \
+  --resource-group <AZURE_RESOURCE_GROUP> --name main \
+  --query "properties.outputs.functionAppName.value" -o tsv)
+echo "$FUNC"
+```
+
+Clone this sample (if you haven't already), install the Node dependencies from
+`package.json`, and publish.
+
+> ⚠️ **Do not skip `npm install`.** `func … publish` uploads the local project
+> directory as-is and does not install dependencies on the server. Publishing
+> without `node_modules/` leaves `onrampApimSync` failing at import — and
+> because Event Grid probes the endpoint during subscription creation with a
+> handshake POST, **Step 8 fails with a `webhookNotification` / webhook
+> validation error** rather than at first invocation. Always run `npm install`
+> in the same directory as `package.json` before `func … publish`.
 
 ```bash
 git clone https://github.com/GoogleCloudPlatform/apigee-samples.git
 cd apigee-samples/apihub-plugins/azure/apim
 
-az login  # if not already authenticated
-func azure functionapp publish func-apihub-onramp --javascript
+az login       # if not already authenticated
+npm install    # installs dependencies declared in package.json into node_modules/
+func azure functionapp publish "$FUNC" --javascript
 ```
 
 Wait for **"Deployment successful"** (~1–2 minutes). The function
@@ -389,8 +464,26 @@ Wait for **"Deployment successful"** (~1–2 minutes). The function
 
 ### Step 8: Create the Event Grid subscription
 
-Azure Portal → open the **APIM service** `<AZURE_APIM_SERVICE>` → left nav →
-**Events → + Event Subscription**.
+**8.1** Enable the APIM instance's **system-assigned managed identity** — API
+Management uses this identity to authenticate to Event Grid when publishing
+control-plane events, and Event Subscription creation fails without it. This is
+a Microsoft-documented prerequisite ([reference][apim-eg]).
+
+Either from the Portal — open the APIM service `<AZURE_APIM_SERVICE>` → left nav
+**Security → Managed identities** → **System assigned** tab → toggle **Status =
+On** → **Save** — or from Cloud Shell:
+
+```bash
+az apim update \
+  --name <AZURE_APIM_SERVICE> \
+  --resource-group <AZURE_RESOURCE_GROUP> \
+  --set identity.type="SystemAssigned"
+```
+
+Wait ~30 seconds for the identity to provision.
+
+**8.2** Create the Event Grid subscription. Azure Portal → APIM service
+`<AZURE_APIM_SERVICE>` → left nav → **Events → + Event Subscription**.
 
 | Field                 | Value                                 |
 | --------------------- | ------------------------------------- |
@@ -402,10 +495,14 @@ Azure Portal → open the **APIM service** `<AZURE_APIM_SERVICE>` → left nav �
 :                       : `Microsoft.ApiManagement.APIDeleted`  :
 | Endpoint Type         | **Azure Function**                    |
 | Endpoint              | Click **Select an endpoint** → pick   |
-:                       : the `func-apihub-onramp` Function App :
-:                       : → function `onrampApimSync`           :
+:                       : the `func-apihub-onramp-<hash>`       :
+:                       : Function App (from Step 6.4 output    :
+:                       : `functionAppName`) → function         :
+:                       : `onrampApimSync`                      :
 
 Click **Create**. Wait ~30 seconds for provisioning.
+
+[apim-eg]: https://learn.microsoft.com/en-us/azure/api-management/how-to-event-grid
 
 ### Step 9: Verify
 
@@ -421,13 +518,31 @@ HTTP** or **OpenAPI**). Within 30–60 seconds:
 If the invocation fails, check the **Result** field on the Monitor page for the
 exception message. Common causes:
 
--   WIF principal binding missing on the SA (revisit Step 6.6 with the
-    `<AZURE_MI_OBJECT_ID>` from Step 6.5).
--   Federated credential missing on the App Registration (revisit Step 6.7).
+-   WIF principal binding missing on the SA (revisit Step 6.5 with the
+    `<AZURE_MI_OBJECT_ID>` from Step 6.4).
+-   Federated credential missing on the App Registration (revisit Step 6.6).
 -   IAM Credentials API not enabled (`gcloud services enable
     iamcredentials.googleapis.com --project=<GCP_PROJECT_ID>`).
 -   Service account missing `roles/apihub.pluginAdmin` on the API hub project
     (revisit Step 4).
+-   **VPC Service Controls violation (`HTTP 403`, `type: VPC_SERVICE_CONTROLS`,
+    `reason: SECURITY_POLICY_VIOLATED`).** If the API hub project sits in a VPC
+    Service Perimeter, `iamcredentials.googleapis.com` and
+    `apihub.googleapis.com` are usually in its restricted-services list, so the
+    Function's WIF impersonation call and the subsequent `CollectApiData` are
+    both denied. Fix: add a perimeter **ingress rule** that permits the Azure
+    caller. Grab the `vpcServiceControlsUniqueIdentifier` from the exception,
+    paste it into Cloud Console → **Security → VPC Service Controls →
+    Troubleshoot** to identify the perimeter, then add an ingress rule with
+    **identities** = the WIF principal
+    (`principal://iam.googleapis.com/projects/<GCP_PROJECT_NUMBER>/locations/global/workloadIdentityPools/apihub-azure-onramp-pool/subject/<AZURE_MI_OBJECT_ID>`)
+    **and** the impersonated SA
+    (`serviceAccount:apihub-azure-onramp-sa@<GCP_PROJECT_ID>.iam.gserviceaccount.com`);
+    **source** = `accessLevel: '*'` (any); **target operations** =
+    `iamcredentials.googleapis.com` and `apihub.googleapis.com`. Both identities
+    are needed in one rule because impersonation is called by the federated
+    principal, and the subsequent `CollectApiData` is called by the impersonated
+    SA.
 
 ## Files Included
 
